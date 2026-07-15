@@ -1,6 +1,12 @@
 import { useState, useEffect, useCallback } from 'react';
 import { distanceInMiles, boundingBox, metersToFeet, headingToCompass } from './utils.js';
 
+// In local dev, this is empty and Vite's proxy (vite.config.js) forwards /api to the
+// backend on localhost:5000. In production, set VITE_API_URL to your deployed backend's
+// URL (e.g. https://your-backend.onrender.com) as an environment variable on your
+// hosting provider — see README for the deployment walkthrough.
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
 const DEFAULT_RADIUS_MILES = 5;
 const MIN_RADIUS_MILES = 1;
 const MAX_RADIUS_MILES = 50; // beyond this, anonymous OpenSky requests get slow/heavy
@@ -43,7 +49,7 @@ function App() {
 
     try {
       const { lamin, lamax, lomin, lomax } = boundingBox(location.lat, location.lon, radiusMiles);
-      const url = `/api/flights?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`;
+      const url = `${API_BASE}/api/flights?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`;
 
       const res = await fetch(url);
       const data = await res.json();
@@ -101,7 +107,7 @@ function App() {
     setRouteLookups((prev) => ({ ...prev, [icao24]: { loading: true } }));
 
     try {
-      const url = `/api/route?icao24=${icao24}`;
+      const url = `${API_BASE}/api/route?icao24=${icao24}`;
 
       const res = await fetch(url);
       const data = await res.json();

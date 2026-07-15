@@ -86,6 +86,49 @@ your browser prompts you.
    resulting bearer token to the OpenSky requests the server makes. Happy to wire this up
    if you want the higher limit — it's a moderate change to the server file only.
 
+## Deploying this for free (frontend + backend on separate services)
+
+Since this app has both a frontend and a backend, they get deployed to two different
+free services.
+
+### Step 1: Deploy the backend to Render
+
+1. Push this project to GitHub (if you haven't already).
+2. Go to https://render.com, sign up free (no credit card required).
+3. Click **New +** → **Web Service** → connect your GitHub repo.
+4. Configure it:
+   - **Root Directory:** `server`
+   - **Build Command:** `npm install`
+   - **Start Command:** `npm start`
+   - **Instance Type:** Free
+5. Click **Create Web Service**. Render will give you a URL like
+   `https://flight-tracker-backend.onrender.com` — copy it.
+
+**Known tradeoff:** Render's free tier spins the service down after 15 minutes of no
+traffic. The next request after that wakes it back up, but takes roughly 30–60 seconds.
+Totally fine for a personal project; just don't expect instant response after it's been
+idle a while.
+
+### Step 2: Deploy the frontend to Vercel or Netlify
+
+1. Go to https://vercel.com (or https://netlify.com), sign up free, import the same
+   GitHub repo.
+2. **Root Directory:** leave as the project root (not `server`).
+3. **Build Command:** `npm run build` — **Output Directory:** `dist` (Vercel/Netlify
+   usually auto-detect this for a Vite project).
+4. Add an environment variable:
+   - **Name:** `VITE_API_URL`
+   - **Value:** the Render backend URL from Step 1 (e.g.
+     `https://flight-tracker-backend.onrender.com`, no trailing slash)
+5. Deploy. You'll get a public URL like `https://flight-tracker.vercel.app`.
+
+### Step 3: Verify
+
+Open your deployed frontend URL, allow location access, and click "Refresh Now." If it
+works locally but not here, double check the `VITE_API_URL` value has no typo and no
+trailing slash, and that the Render service shows as "Live" in its dashboard (not still
+building or crashed — check its logs tab if so).
+
 ## Possible next steps
 
 - Add a live map view (e.g. with Leaflet or Mapbox) showing aircraft positions visually,
