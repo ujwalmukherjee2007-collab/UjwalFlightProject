@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { distanceInMiles, boundingBox, metersToFeet, headingToCompass } from './utils.js';
+import { distanceInMiles, metersToFeet, headingToCompass } from './utils.js';
 
 // In local dev, this is empty and Vite's proxy (vite.config.js) forwards /api to the
 // backend on localhost:5000. In production, set VITE_API_URL to your deployed backend's
@@ -9,7 +9,7 @@ const API_BASE = import.meta.env.VITE_API_URL || '';
 
 const DEFAULT_RADIUS_MILES = 5;
 const MIN_RADIUS_MILES = 1;
-const MAX_RADIUS_MILES = 50; // beyond this, anonymous OpenSky requests get slow/heavy
+const MAX_RADIUS_MILES = 50; // adsb.lol's point-radius query caps at 250 nautical miles anyway
 
 function App() {
   const [location, setLocation] = useState(null);
@@ -41,15 +41,14 @@ function App() {
     );
   }, []);
 
-  // Step 2: fetch nearby flights from OpenSky whenever we have a location.
+  // Step 2: fetch nearby flights from adsb.lol whenever we have a location.
   const fetchFlights = useCallback(async () => {
     if (!location) return;
     setLoading(true);
     setError('');
 
     try {
-      const { lamin, lamax, lomin, lomax } = boundingBox(location.lat, location.lon, radiusMiles);
-      const url = `${API_BASE}/api/flights?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`;
+      const url = `${API_BASE}/api/flights?lat=${location.lat}&lon=${location.lon}&radiusMiles=${radiusMiles}`;
 
       const res = await fetch(url);
       const data = await res.json();
@@ -61,18 +60,6 @@ function App() {
       const states = data.states || [];
 
       const parsed = states
-        .map((s) => ({
-          icao24: s[0],
-          callsign: (s[1] || '').trim() || 'Unknown',
-          originCountry: s[2],
-          longitude: s[5],
-          latitude: s[6],
-          baroAltitudeM: s[7],
-          onGround: s[8],
-          velocityMs: s[9],
-          heading: s[10],
-          geoAltitudeM: s[13]
-        }))
         .filter((f) => f.latitude !== null && f.longitude !== null)
         .map((f) => ({
           ...f,
@@ -100,14 +87,14 @@ function App() {
     }
   }, [location, fetchFlights]);
 
-  // Best-effort route lookup. OpenSky's flights/aircraft endpoint is historical and
-  // rate-limited, and often has no data for a flight still in progress — so this is
-  // opt-in per row rather than automatic for every flight in the table.
-  const lookupRoute = async (icao24) => {
+  // Route lookup via adsbdb.com, keyed by callsign. Unlike OpenSky's historical-only
+  // data, this works for flights still in progress since it looks up the scheduled
+  // route for the callsign directly rather than waiting for the flight to land.
+  const lookupRoute = async (icao24, callsign) => {
     setRouteLookups((prev) => ({ ...prev, [icao24]: { loading: true } }));
 
     try {
-      const url = `${API_BASE}/api/route?icao24=${icao24}`;
+      const url = `${API_BASE}/api/route?callsign=${encodeURIComponent(callsign)}`;
 
       const res = await fetch(url);
       const data = await res.json();
@@ -116,7 +103,7 @@ function App() {
         throw new Error(data.error || `Status ${res.status}`);
       }
 
-      if (!data || data.length === 0) {
+      if (!data.source && !data.destination) {
         setRouteLookups((prev) => ({
           ...prev,
           [icao24]: { loading: false, source: 'Unknown', destination: 'Unknown' }
@@ -124,16 +111,14 @@ function App() {
         return;
       }
 
-      const latest = data[data.length - 1];
-      const dep = latest.departureAirportInfo;
-      const arr = latest.arrivalAirportInfo;
-
       setRouteLookups((prev) => ({
         ...prev,
         [icao24]: {
           loading: false,
-          source: dep ? `${dep.city} (${dep.icao})` : 'Unknown',
-          destination: arr ? `${arr.city} (${arr.icao})` : 'In progress / unknown'
+          source: data.source ? `${data.source.city} (${data.source.icao})` : 'Unknown',
+          destination: data.destination
+            ? `${data.destination.city} (${data.destination.icao})`
+            : 'Unknown'
         }
       }));
     } catch (err) {
@@ -145,7 +130,7 @@ function App() {
   };
 
   // Validates and applies the user's radius input. Clamps to sane bounds so a typo
-  // (like 5000 miles) doesn't send a huge, slow, or invalid bounding box to OpenSky.
+  // (like 5000 miles) doesn't send an oversized or invalid radius to adsb.lol.
   const applyRadius = () => {
     const parsed = parseFloat(radiusInput);
 
@@ -169,7 +154,7 @@ function App() {
   return (
     <div className="container">
       <h1>Flights Within {radiusMiles} Miles</h1>
-      <p className="subtitle">Live aircraft near your current location, via OpenSky Network.</p>
+      <p className="subtitle">Live aircraft near your current location, via adsb.lol.</p>
 
       {locationError && <p className="error">{locationError}</p>}
 
@@ -234,8 +219,7 @@ function App() {
               return (
                 <tr key={f.icao24}>
                   <td>
-                    <div className="callsign">{f.callsign}</div>
-                    <div className="origin-country">{f.originCountry}</div>
+                    <div className="callsign">{f.callsign || 'Unknown'}</div>
                   </td>
                   <td>{f.onGround ? 'On ground' : altitudeFt !== null ? `${altitudeFt.toLocaleString()} ft` : '—'}</td>
                   <td>{speedMph !== null ? `${speedMph} mph` : '—'}</td>
@@ -248,10 +232,13 @@ function App() {
                   </td>
                   <td>{f.distanceMiles.toFixed(2)} mi</td>
                   <td colSpan={routeInfo && !routeInfo.loading && !routeInfo.error ? 1 : 2}>
-                    {!routeInfo && (
-                      <button className="route-btn" onClick={() => lookupRoute(f.icao24)}>
+                    {!routeInfo && f.callsign && (
+                      <button className="route-btn" onClick={() => lookupRoute(f.icao24, f.callsign)}>
                         Look up route
                       </button>
+                    )}
+                    {!routeInfo && !f.callsign && (
+                      <span className="error-inline">No callsign</span>
                     )}
                     {routeInfo?.loading && <span>Looking up...</span>}
                     {routeInfo?.error && <span className="error-inline">{routeInfo.error}</span>}
@@ -268,9 +255,11 @@ function App() {
       )}
 
       <p className="disclaimer">
-        Route (source/destination) data is historical and best-effort — OpenSky's free tier
-        often has no route info for flights still in the air. Position and altitude data
-        typically has a delay of several seconds to a couple of minutes.
+        Route (source/destination) lookups use the flight's callsign via adsbdb.com, and
+        work even for flights still in the air — but not every callsign has a route on
+        file, and aircraft not broadcasting a callsign can't be looked up at all.
+        Position and altitude data typically has a delay of several seconds to a couple
+        of minutes.
       </p>
     </div>
   );

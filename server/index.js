@@ -1,99 +1,130 @@
 import express from 'express';
 import cors from 'cors';
-import { readFileSync } from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-// Airport ICAO -> { name, city, country } lookup, built from the OurAirports public
-// domain dataset (https://ourairports.com/data/). OpenSky only ever gives us ICAO
-// codes (e.g. "KJFK"), never a city name, so this fills that gap locally with no
-// extra API calls or rate-limit cost.
-const airportLookup = JSON.parse(readFileSync(join(__dirname, 'airports.json'), 'utf-8'));
-
-function resolveAirport(icaoCode) {
-  if (!icaoCode) return null;
-  const info = airportLookup[icaoCode.toUpperCase()];
-  if (!info) return { icao: icaoCode, city: 'Unknown', name: 'Unknown', country: null };
-  return { icao: icaoCode, city: info.city || 'Unknown', name: info.name, country: info.country };
-}
 
 const app = express();
 app.use(cors());
 
 const PORT = process.env.PORT || 5000;
 
-// OpenSky's API doesn't reliably send Access-Control-Allow-Origin, so browsers block
-// direct requests to it. This server fetches on the browser's behalf and returns the
-// data with CORS enabled for our own frontend — a standard proxy workaround.
+// --- Data sources ---
+// Live positions: adsb.lol (https://api.adsb.lol) — a free, open, community-run
+// ADS-B aggregator. Unlike OpenSky, it's explicitly built for open public/programmatic
+// use and doesn't block cloud-hosting IP ranges, which OpenSky does (see their own
+// GitHub notice: "We may block AWS and other hyperscalers due to generalized abuse").
+//
+// Route lookups: adsbdb.com (https://api.adsbdb.com) — a free, open API that maps a
+// flight's callsign to its origin/destination airport (with city names included).
+// This actually works for flights still in progress, unlike OpenSky's historical-only
+// route data, since it looks up the scheduled route for the callsign directly rather
+// than waiting for the flight to land.
+
+function nauticalMilesFromMiles(miles) {
+  return miles * 0.868976;
+}
+
 app.get('/api/flights', async (req, res) => {
   try {
-    const { lamin, lomin, lamax, lomax } = req.query;
-    if (!lamin || !lomin || !lamax || !lomax) {
-      return res.status(400).json({ error: 'Missing bounding box parameters.' });
+    const { lat, lon, radiusMiles } = req.query;
+    if (!lat || !lon || !radiusMiles) {
+      return res.status(400).json({ error: 'Missing lat, lon, or radiusMiles parameter.' });
     }
 
-    const url = `https://opensky-network.org/api/states/all?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`;
+    // adsb.lol's point-radius query caps at 250 nautical miles.
+    const radiusNm = Math.min(nauticalMilesFromMiles(parseFloat(radiusMiles)), 250);
+    const url = `https://api.adsb.lol/v2/point/${lat}/${lon}/${radiusNm}`;
+
     const response = await fetch(url);
 
     if (response.status === 429) {
-      return res.status(429).json({
-        error:
-          "OpenSky's daily limit for anonymous requests (400/day) has been reached. This resets after 24 hours."
-      });
+      return res.status(429).json({ error: 'Rate-limited by adsb.lol. Try again in a moment.' });
     }
     if (!response.ok) {
-      return res.status(502).json({ error: `OpenSky API returned status ${response.status}` });
+      return res.status(502).json({ error: `adsb.lol API returned status ${response.status}` });
     }
 
     const data = await response.json();
-    res.json(data);
+    const aircraftList = data.ac || [];
+
+    // Normalize adsb.lol's fields (feet, knots, "ground" sentinel string) into the
+    // shape the frontend expects (meters, m/s, boolean on-ground flag).
+    const states = aircraftList.map((ac) => {
+      const onGround = ac.alt_baro === 'ground';
+      return {
+        icao24: ac.hex || null,
+        callsign: (ac.flight || '').trim() || null,
+        originCountry: null, // not provided by this data source
+        longitude: typeof ac.lon === 'number' ? ac.lon : null,
+        latitude: typeof ac.lat === 'number' ? ac.lat : null,
+        onGround,
+        baroAltitudeM:
+          typeof ac.alt_baro === 'number' ? ac.alt_baro / 3.28084 : null,
+        geoAltitudeM:
+          typeof ac.alt_geom === 'number' ? ac.alt_geom / 3.28084 : null,
+        velocityMs: typeof ac.gs === 'number' ? ac.gs * 0.514444 : null,
+        heading: typeof ac.track === 'number' ? ac.track : null
+      };
+    });
+
+    res.json({ states });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Could not reach OpenSky. Check server internet access.' });
+    console.error('Error in /api/flights:', err);
+    res.status(500).json({
+      error: `Could not reach adsb.lol: ${err.message || err.cause?.message || 'unknown network error'}`
+    });
   }
 });
 
-// Best-effort route (source/destination) lookup — see README for its limitations.
 app.get('/api/route', async (req, res) => {
   try {
-    const { icao24 } = req.query;
-    if (!icao24) {
-      return res.status(400).json({ error: 'Missing icao24 parameter.' });
+    const { callsign } = req.query;
+    if (!callsign || !callsign.trim()) {
+      return res
+        .status(400)
+        .json({ error: 'No callsign available for this aircraft — route lookup needs one.' });
     }
 
-    const now = Math.floor(Date.now() / 1000);
-    const sixHoursAgo = now - 6 * 60 * 60;
-    const url = `https://opensky-network.org/api/flights/aircraft?icao24=${icao24}&begin=${sixHoursAgo}&end=${now}`;
-
+    const url = `https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign.trim())}`;
     const response = await fetch(url);
 
+    if (response.status === 404) {
+      // adsbdb has no route on file for this callsign — not an error, just unknown.
+      return res.json({ source: null, destination: null });
+    }
     if (response.status === 429) {
-      return res.status(429).json({ error: 'Rate-limited by OpenSky. Try again later.' });
+      return res.status(429).json({ error: 'Rate-limited by adsbdb.com. Try again in a moment.' });
     }
     if (!response.ok) {
-      // OpenSky returns 404 when there's simply no route data — not a real error.
-      if (response.status === 404) {
-        return res.json([]);
-      }
-      return res.status(502).json({ error: `OpenSky API returned status ${response.status}` });
+      return res.status(502).json({ error: `adsbdb API returned status ${response.status}` });
     }
 
     const data = await response.json();
+    const route = data?.response?.flightroute;
 
-    // Attach resolved city/name info for the departure and arrival airports,
-    // alongside the raw ICAO codes OpenSky gives us.
-    const enriched = data.map((flight) => ({
-      ...flight,
-      departureAirportInfo: resolveAirport(flight.estDepartureAirport),
-      arrivalAirportInfo: resolveAirport(flight.estArrivalAirport)
-    }));
+    if (!route) {
+      return res.json({ source: null, destination: null });
+    }
 
-    res.json(enriched);
+    const shapeAirport = (airport) =>
+      airport
+        ? {
+            city: airport.municipality || 'Unknown',
+            name: airport.name,
+            icao: airport.icao_code,
+            iata: airport.iata_code,
+            country: airport.country_name
+          }
+        : null;
+
+    res.json({
+      airline: route.airline?.name || null,
+      source: shapeAirport(route.origin),
+      destination: shapeAirport(route.destination)
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Could not reach OpenSky. Check server internet access.' });
+    console.error('Error in /api/route:', err);
+    res.status(500).json({
+      error: `Could not reach adsbdb.com: ${err.message || err.cause?.message || 'unknown network error'}`
+    });
   }
 });
 
